@@ -4,9 +4,11 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
@@ -15,17 +17,16 @@ import (
 	"strings"
 
 	"github.com/ogier/pflag"
-	"io/ioutil"
 )
 
+// Config defines structure of the config file.
 type Config struct {
-	WebhookUrl string  `json:"webhook_url"`
-	Channel    string  `json:"channel"`
-	Username   string  `json:"username"`
-	IconEmoji  string  `json:"icon_emoji"`
-	Proxy      string  `json:"proxy"`
+	HipchatURL string `json:"hipchat_url"`
+	Room       string `json:"room"`
+	APIToken   string `json:"api_token"`
 }
 
+// Load loads in a found config file.
 func (c *Config) Load() error {
 	err := c.loadConfigFiles()
 	if err != nil {
@@ -33,30 +34,32 @@ func (c *Config) Load() error {
 	}
 	c.loadEnvVars()
 
-	if c.WebhookUrl == "" {
-		return errors.New("Could not find a WebhookUrl in SLACKCAT_WEBHOOK_URL, /etc/slackcat.conf, /.slackcat.conf, ./slackcat.conf")
+	if c.HipchatURL == "" {
+		return errors.New("Could not find a HipchatURL in HIPCHAT_URL, /etc/hipcat.conf, /.hipcat.conf, ./hipcat.conf")
+	}
+
+	if c.APIToken == "" {
+		return errors.New("Could not find an APIToken in HIPCAT_API_TOKEN, /etc/hipcat.conf, /.hipcat.conf, ./hipcat.conf")
 	}
 
 	return nil
 }
 
 func (c *Config) loadEnvVars() {
-	envs := []string{"SLACKCAT_WEBHOOK_URL", "SLACKCAT_CHANNEL", "SLACKCAT_USERNAME", "SLACKCAT_ICON"}
-	for _,env := range envs {
+	envs := []string{"HIPCHAT_URL", "HIPCAT_ROOM", "HIPCAT_API_TOKEN"}
+	for _, env := range envs {
 		envVal := os.Getenv(env)
 		if envVal == "" {
 			continue
 		}
 
 		switch env {
-		case "SLACKCAT_WEBHOOK_URL":
-			c.WebhookUrl = envVal
-		case "SLACKCAT_CHANNEL":
-			c.Channel = envVal
-		case "SLACKCAT_USERNAME":
-			c.Username = envVal
-		case "SLACKCAT_ICON":
-			c.IconEmoji = envVal
+		case "HIPCHAT_URL":
+			c.HipchatURL = envVal
+		case "HIPCAT_ROOM":
+			c.Room = envVal
+		case "HIPCAT_API_TOKEN":
+			c.APIToken = envVal
 		}
 	}
 }
@@ -68,7 +71,7 @@ func (c *Config) loadConfigFiles() error {
 		homeDir = usr.HomeDir
 	}
 
-	for _, path := range []string{"/etc/slackcat.conf", homeDir + "/.slackcat.conf", "./slackcat.conf"} {
+	for _, path := range []string{"/etc/hipcat.conf", homeDir + "/.hipcat.conf", "./hipcat.conf"} {
 		file, err := os.Open(path)
 		if os.IsNotExist(err) {
 			continue
@@ -86,22 +89,17 @@ func (c *Config) loadConfigFiles() error {
 	return nil
 }
 
-func (c *Config) BindFlags() {
-	pflag.StringVarP(&c.Channel, "channel", "c", c.Channel, "channel")
-	pflag.StringVarP(&c.Username, "name", "n", c.Username, "name")
-	pflag.StringVarP(&c.IconEmoji, "icon", "i", c.IconEmoji, "icon")
-	pflag.StringVarP(&c.Proxy, "proxy", "p", c.Proxy, "proxy")
+func (c *Config) bindFlags() {
+	pflag.StringVarP(&c.Room, "room", "r", c.Room, "room")
 }
 
-type SlackMsg struct {
-	Channel   string `json:"channel"`
-	Username  string `json:"username,omitempty"`
-	Text      string `json:"text"`
-	Parse     string `json:"parse"`
-	IconEmoji string `json:"icon_emoji,omitempty"`
+// RoomMessage contains the message for the Hipchat room.
+type RoomMessage struct {
+	Message string `json:"message"`
 }
 
-func (m SlackMsg) Encode() (string, error) {
+// Encode encodes the RoomMessage into a json string.
+func (m RoomMessage) Encode() (string, error) {
 	b, err := json.Marshal(m)
 	if err != nil {
 		return "", err
@@ -109,80 +107,68 @@ func (m SlackMsg) Encode() (string, error) {
 	return string(b), nil
 }
 
-func (m SlackMsg) Post(WebhookURL string, Proxy string) error {
+// Post posts the RoomMessage to the Hipchat server.
+func (m RoomMessage) Post(config *Config) error {
 	encoded, err := m.Encode()
 	if err != nil {
 		return err
 	}
 
-	if len(Proxy) > 0 {
-		proxyUrl, err := url.Parse(Proxy)
-		http.DefaultTransport = &http.Transport{Proxy: http.ProxyURL(proxyUrl)}
-
-		if err != nil {
-			return err
-		}
-
-	}
-
-	resp, err := http.PostForm(WebhookURL, url.Values{"payload": {encoded}})
+	URL, err := url.Parse(fmt.Sprintf("%s/v2/room/%s/message",
+		config.HipchatURL, config.Room))
 	if err != nil {
 		return err
 	}
 
+	var req *http.Request
+	req, err = http.NewRequest("POST", URL.String(), bytes.NewBuffer([]byte(encoded)))
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", config.APIToken))
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusCreated {
 		body, err := ioutil.ReadAll(resp.Body)
 		if err != nil {
 			return err
 		}
 
-		return errors.New(fmt.Sprintf("Not OK: %d, %s", resp.StatusCode, body))
+		return fmt.Errorf("Not OK: %d, %s", resp.StatusCode, body)
 	}
 	return nil
 }
 
-func defaultUsername() string {
-	username := "<unknown>"
-	usr, err := user.Current()
-	if err == nil {
-		username = usr.Username
-	}
-
-	hostname := "<unknown>"
-	host, err := os.Hostname()
-	if err == nil {
-		hostname = host
-	}
-	return fmt.Sprintf("%s@%s", username, hostname)
-}
-
 func main() {
 	pflag.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: slackcat [-c #channel] [-n name] [-i icon] [-p proxy] [message]")
+		fmt.Fprintln(os.Stderr, "Usage: hipcat [-r room] [message]")
 	}
 
-	cfg := Config{Username: defaultUsername()}
+	cfg := Config{}
 	err := cfg.Load()
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
-	cfg.BindFlags()
+	cfg.bindFlags()
 	pflag.Parse()
 
+	if cfg.Room == "" {
+		log.Println("Could not find a Room in HIPCAT_ROOM, /etc/hipcat.conf, /.hipcat.conf, ./hipcat.conf or passed with -r")
+		pflag.Usage()
+		os.Exit(1)
+	}
 	// was there a message on the command line? If so use it.
 	args := pflag.Args()
 	if len(args) > 0 {
-		msg := SlackMsg{
-			Channel:   cfg.Channel,
-			Username:  cfg.Username,
-			Parse:     "full",
-			Text:      strings.Join(args, " "),
-			IconEmoji: cfg.IconEmoji,
+		msg := RoomMessage{
+			Message: strings.Join(args, " "),
 		}
 
-		err = msg.Post(cfg.WebhookUrl, cfg.Proxy)
+		err = msg.Post(&cfg)
 		if err != nil {
 			log.Fatalf("Post failed: %v", err)
 		}
@@ -192,15 +178,11 @@ func main() {
 	// ...Otherwise scan stdin
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
-		msg := SlackMsg{
-			Channel:   cfg.Channel,
-			Username:  cfg.Username,
-			Parse:     "full",
-			Text:      scanner.Text(),
-			IconEmoji: cfg.IconEmoji,
+		msg := RoomMessage{
+			Message: scanner.Text(),
 		}
 
-		err = msg.Post(cfg.WebhookUrl, cfg.Proxy)
+		err = msg.Post(&cfg)
 		if err != nil {
 			log.Fatalf("Post failed: %v", err)
 		}
